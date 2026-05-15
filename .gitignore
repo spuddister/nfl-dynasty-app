@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment — never commit real keys
+.env
+
+# Local data cache
+data/fantasy.db
+data/sleeper_players.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Claude Code
+.claude/
