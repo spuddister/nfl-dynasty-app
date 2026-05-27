@@ -81,13 +81,6 @@ else
     echo -e "  ${GREEN}✓ Google Gemini API key configured${RESET}"
 fi
 
-# Check Reddit (optional)
-REDDIT_ID=$(grep -E '^REDDIT_CLIENT_ID=' .env | cut -d= -f2- | tr -d '"')
-if [ -z "$REDDIT_ID" ]; then
-    echo -e "  ${YELLOW}⚠  Reddit not configured (optional — enables live player sentiment)${RESET}"
-    echo -e "     Run ${BOLD}uv run fantasy setup${RESET} to add Reddit credentials."
-fi
-
 # ── Done — show menu ──────────────────────────────────────────────────────────
 echo -e "\n${GREEN}${BOLD}Setup complete!${RESET}\n"
 echo -e "${BOLD}Available commands:${RESET}"
@@ -97,6 +90,7 @@ echo -e "  ${CYAN}uv run fantasy draft-board${RESET}      Rookie draft board (up
 echo -e "  ${CYAN}uv run fantasy roster-review${RESET}    Deep weekly roster + dynasty strategy review"
 echo -e "  ${CYAN}uv run fantasy weekly${RESET}           Quick start/sit + waiver wire targets"
 echo -e "  ${CYAN}uv run fantasy trade${RESET}            Evaluate a trade offer"
+echo -e "  ${CYAN}uv run fantasy propose-trade${RESET}    Generate trade proposals to send to other teams"
 echo -e "  ${CYAN}uv run fantasy rookies${RESET}          Scout the rookie class (qualitative)"
 echo -e "  ${CYAN}uv run fantasy ask \"...\"${RESET}        Ask anything about your team"
 echo -e ""

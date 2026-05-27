@@ -15,7 +15,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Prompt
 from rich.live import Live
 from rich.text import Text
 
@@ -65,8 +65,7 @@ def setup():
     """Configure your .env file with API keys."""
     console.print(Panel.fit(
         "[bold cyan]Fantasy AI Setup[/bold cyan]\n"
-        "Sleeper is pre-configured — you just need your Google Gemini API key.\n"
-        "Reddit credentials are optional but enable live player sentiment.",
+        "Sleeper is pre-configured — you just need your Google Gemini API key.",
         title="Setup"
     ))
 
@@ -94,13 +93,6 @@ def setup():
     key = Prompt.ask("  GOOGLE_API_KEY", default=existing.get("GOOGLE_API_KEY", ""), password=True)
     if key:
         updates["GOOGLE_API_KEY"] = key
-
-    console.print("\n[bold]2. Reddit (optional)[/bold]")
-    console.print("  Enables live Reddit sentiment search for players.")
-    console.print("  Create a 'script' app at: https://www.reddit.com/prefs/apps")
-    if Confirm.ask("  Configure Reddit?", default=False):
-        updates["REDDIT_CLIENT_ID"] = Prompt.ask("  REDDIT_CLIENT_ID", default=existing.get("REDDIT_CLIENT_ID", ""))
-        updates["REDDIT_CLIENT_SECRET"] = Prompt.ask("  REDDIT_CLIENT_SECRET", default=existing.get("REDDIT_CLIENT_SECRET", ""), password=True)
 
     # Write back
     lines = env_path.read_text().splitlines()
@@ -270,7 +262,7 @@ def roster_review(week: int = typer.Option(None, "--week", "-w", help="Override 
 
 @app.command()
 def rookies():
-    """Qualitative rookie class scouting (Reddit + KTC analysis).
+    """Qualitative rookie class scouting (KTC values + landing spot analysis).
 
     Use `draft-board` for the full ranked board with live draft availability.
     Use this command for a qualitative deep-dive on the rookie class.
@@ -280,6 +272,39 @@ def rookies():
     agent = FantasyAgent()
     result = _run_agent("Rookie Scouting", agent.scout_rookies)
     console.print(Panel(Markdown(result), title="[bold cyan]2026 Rookie Class Scouting[/bold cyan]", expand=True))
+
+
+@app.command(name="propose-trade")
+def propose_trade(
+    team: str = typer.Option(
+        None, "--team", "-t",
+        help="Target a specific team owner name (e.g. 'Rickdaddy47'). Omit to find the top 3 deals across all teams."
+    )
+):
+    """Generate trade proposals you should send to maximize your dynasty team.
+
+    Scans all league rosters, identifies the best trading partners for your needs,
+    and outputs concrete deals that are favorable to you but enticing for the
+    other team. Optionally target a specific team with --team.
+    """
+    from .agents.fantasy_agent import FantasyAgent
+
+    league = _load_league()
+    if not league.my_team:
+        console.print("[red]Your team was not found. Check SLEEPER_USER_ID in .env.[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[cyan]Team:[/cyan] {league.my_team.name}  "
+        f"[cyan]Record:[/cyan] {league.my_team.record_wins}W-{league.my_team.record_losses}L"
+        + (f"  [cyan]Targeting:[/cyan] {team}" if team else "  [cyan]Scanning all opponents...[/cyan]")
+    )
+
+    label = f"Trade Proposals → {team}" if team else "Trade Proposal Scanner"
+    agent = FantasyAgent()
+    result = _run_agent(label, agent.generate_trade_proposal, league, target_team=team)
+    title = f"[bold cyan]Proposed Trades{f' → {team}' if team else ''}[/bold cyan]"
+    console.print(Panel(Markdown(result), title=title, expand=True))
 
 
 @app.command()

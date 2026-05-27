@@ -277,3 +277,34 @@ def format_roster_summary(league: LeagueInfo) -> str:
             f"{p.injury_status.value if p.injury_status.value != 'Healthy' else ''}"
         )
     return "\n".join(lines)
+
+
+def format_all_teams_summary(league: LeagueInfo) -> str:
+    """Return a compact summary of all other teams' rosters for trade analysis."""
+    lines: list[str] = [
+        f"OPPONENT ROSTERS — {league.name} {league.season}",
+        "=" * 60,
+    ]
+    for team in sorted(league.teams, key=lambda t: (-t.record_wins, t.name)):
+        if team.is_mine:
+            continue
+        record = f"{team.record_wins}W-{team.record_losses}L"
+        waiver = f"  [Waiver: #{team.waiver_priority}]" if team.waiver_priority else ""
+        lines.append(f"\nTeam: {team.name} ({record}){waiver}")
+        by_pos: dict[str, list[str]] = {}
+        for p in team.roster:
+            pos = p.position.value
+            if pos not in ("QB", "RB", "WR", "TE"):
+                continue
+            inj = (
+                f" [{p.injury_status.value}]"
+                if p.injury_status.value not in ("Healthy", "Unknown") else ""
+            )
+            by_pos.setdefault(pos, []).append(
+                f"{p.name} ({p.age or '?'}, {p.nfl_team}){inj}"
+            )
+        for pos in ("QB", "RB", "WR", "TE"):
+            players = by_pos.get(pos)
+            if players:
+                lines.append(f"  {pos:<4}: {' | '.join(players)}")
+    return "\n".join(lines)

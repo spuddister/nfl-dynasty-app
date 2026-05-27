@@ -1,6 +1,6 @@
 # Fantasy AI
 
-Your personal dynasty fantasy football assistant. It pulls live data from Sleeper, checks injury reports, searches Reddit for player buzz, and gives you clear recommendations — no spreadsheets required.
+Your personal dynasty fantasy football assistant. It pulls live data from Sleeper, checks injury reports, looks up KTC dynasty values, and gives you clear recommendations — no spreadsheets required.
 
 ---
 
@@ -44,18 +44,6 @@ GOOGLE_API_KEY=your_key_here
 
 The Sleeper league settings are already pre-filled — you only need the Google key.
 
-**4. Optional: Reddit credentials**
-
-Reddit lets the assistant search for live player sentiment, injury buzz, and waiver chatter on r/dynastyff and r/fantasyfootball. Without it the assistant still works — it just skips Reddit.
-
-1. Go to [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps) → **create another app** → choose **script**
-2. Add to `.env`:
-
-```
-REDDIT_CLIENT_ID=your_client_id
-REDDIT_CLIENT_SECRET=your_client_secret
-```
-
 ---
 
 ## Running commands
@@ -89,7 +77,7 @@ uv run fantasy analyze-roster
 ### `uv run fantasy weekly`
 **Start/sit decisions and waiver wire targets for the current week.**
 
-Checks injuries, Sleeper trending adds, and Reddit, then tells you exactly who to start and who to pick up.
+Checks injuries and Sleeper trending adds, then tells you exactly who to start and who to pick up.
 
 ```bash
 uv run fantasy weekly                # current week
@@ -110,6 +98,20 @@ uv run fantasy roster-review --week 8
 
 ---
 
+### `uv run fantasy propose-trade`
+**Generate trade proposals you should send to maximize your dynasty team.**
+
+Scans all 9 opponent rosters, pulls KTC dynasty values for every player in the league, checks the injury report for sell-high opportunities, and reviews recent trade history to understand which teams are willing to deal. Outputs 3 concrete proposals — one per best trading partner — each slightly favorable to you but structured to be genuinely appealing to the other team.
+
+```bash
+uv run fantasy propose-trade                       # find the top 3 deals across all teams
+uv run fantasy propose-trade --team Rickdaddy47    # target a specific opponent
+```
+
+This command makes a single Gemini API call (all data is pre-fetched in Python), so it runs fast and doesn't hit rate limits.
+
+---
+
 ### `uv run fantasy draft-board`
 **Rookie draft board with live availability.**
 
@@ -126,7 +128,7 @@ uv run fantasy draft-board
 ### `uv run fantasy rookies`
 **Qualitative rookie class scouting.**
 
-A deeper dive into the rookie class using Reddit buzz, KTC dynasty values, and landing spot analysis. Use `draft-board` for the ranked board; use this for the "why" behind each prospect.
+A deeper dive into the rookie class using KTC dynasty values and landing spot analysis. Use `draft-board` for the ranked board; use this for the "why" behind each prospect.
 
 ```bash
 uv run fantasy rookies
@@ -150,7 +152,7 @@ You'll be prompted to enter each player's name, position, NFL team, and age. Typ
 ### `uv run fantasy setup`
 **Interactive wizard to configure your `.env` file.**
 
-If you'd rather not edit `.env` by hand, this walks you through setting your API keys.
+If you'd rather not edit `.env` by hand, this walks you through setting your Google API key.
 
 ```bash
 uv run fantasy setup
@@ -162,5 +164,6 @@ uv run fantasy setup
 
 - **Run `roster-review` once a week** — it's the most comprehensive command and gives you a full action checklist.
 - **Run `draft-board` on draft day** — re-run it after each pick to see updated availability.
+- **Use `propose-trade` after `analyze-roster`** — once you know your sell-high candidates, let the AI find the right target.
 - **Use `ask` for one-off questions** — it has full access to your roster and all the same tools.
 - All data is cached locally (KTC values for 24h, injury reports for 2h) so repeat runs are fast.

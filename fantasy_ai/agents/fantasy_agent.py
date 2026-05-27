@@ -1,7 +1,7 @@
 """Core Gemini-powered fantasy football agent.
 
 Uses Google Gemini's function calling API (google-genai SDK) to autonomously:
-  - Search Reddit for player sentiment
+  - Pull live injury reports and player news
   - Pull Sleeper trending data and draft info
   - Fetch KTC dynasty values, ADP, injury reports, news
   - Analyze rosters, trades, lineups, and waiver wire picks
@@ -11,18 +11,23 @@ Get a key at: https://aistudio.google.com
 """
 from __future__ import annotations
 import json
+import re
 import time
 from typing import Any
 
+import httpx
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError, ServerError
 
 from ..config.settings import get_settings
 from ..models.player import Player, Position
 from ..models.league import LeagueInfo, TradeOffer
-from ..tools.reddit_tool import search_reddit_for_player, get_weekly_news_digest
 from ..tools.stats_tool import get_ktc_values, get_player_adp, get_injury_report, get_player_news
-from ..tools.sleeper_tool import get_trending_adds, get_trending_drops, get_draft_info, format_roster_summary
+from ..tools.sleeper_tool import (
+    get_trending_adds, get_trending_drops, get_draft_info,
+    get_transactions, format_roster_summary, format_all_teams_summary,
+)
 from ..tools.draft_tool import build_rookie_board, format_draft_board, get_my_draft_picks_context
 from ..db.database import init_db
 
@@ -30,22 +35,6 @@ from ..db.database import init_db
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
 _TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="search_reddit",
-        description=(
-            "Search Reddit (r/dynastyff, r/fantasyfootball, r/nfl) for recent posts "
-            "about a specific NFL player. Returns post titles and top comments. "
-            "Use for sentiment, injury news, depth chart updates, dynasty outlook."
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "player_name": types.Schema(type=types.Type.STRING, description="Full name, e.g. 'George Pickens'"),
-                "max_posts": types.Schema(type=types.Type.INTEGER, description="Number of posts to fetch (default 10)"),
-            },
-            required=["player_name"],
-        ),
-    ),
     types.FunctionDeclaration(
         name="get_ktc_dynasty_value",
         description=(
@@ -83,11 +72,6 @@ _TOOL_DECLARATIONS = [
             properties={"player_name": types.Schema(type=types.Type.STRING)},
             required=["player_name"],
         ),
-    ),
-    types.FunctionDeclaration(
-        name="get_weekly_reddit_digest",
-        description="Fetch weekly discussion and waiver wire threads from r/fantasyfootball.",
-        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
     ),
     types.FunctionDeclaration(
         name="get_sleeper_trending",
@@ -133,11 +117,7 @@ GEMINI_TOOLS = types.Tool(function_declarations=_TOOL_DECLARATIONS)
 
 def _execute_tool(name: str, inputs: dict) -> str:
     try:
-        if name == "search_reddit":
-            return search_reddit_for_player(
-                inputs["player_name"], max_posts=inputs.get("max_posts", 10)
-            )
-        elif name == "get_ktc_dynasty_value":
+        if name == "get_ktc_dynasty_value":
             values = get_ktc_values()
             player = inputs["player_name"]
             for k, v in values.items():
@@ -150,8 +130,6 @@ def _execute_tool(name: str, inputs: dict) -> str:
             return get_injury_report()
         elif name == "get_player_news":
             return get_player_news(inputs["player_name"])
-        elif name == "get_weekly_reddit_digest":
-            return get_weekly_news_digest()
         elif name == "get_sleeper_trending":
             trend_type = inputs.get("type", "add")
             count = int(inputs.get("count", 20))
@@ -187,6 +165,78 @@ def _execute_tool(name: str, inputs: dict) -> str:
         return f"Tool error ({name}): {e}"
 
 
+# ── Trade proposal helpers ────────────────────────────────────────────────────
+
+def _build_ktc_roster_table(league: LeagueInfo, ktc_all: dict[str, int]) -> str:
+    """Build a KTC value table for tradeable players (QB/RB/WR/TE) on league rosters."""
+    rows: list[str] = []
+    seen: set[str] = set()
+    for team in league.teams:
+        for p in team.roster:
+            if p.name in seen or p.position.value not in ("QB", "RB", "WR", "TE"):
+                continue
+            seen.add(p.name)
+            ktc_val: int | None = None
+            name_lower = p.name.lower()
+            for k, v in ktc_all.items():
+                if name_lower in k.lower() or k.lower() in name_lower:
+                    ktc_val = v
+                    break
+            if ktc_val is None:
+                continue  # skip unranked players to keep prompt small
+            label = "MY TEAM" if team.is_mine else team.name
+            rows.append(
+                f"  {p.name} ({p.position.value}, {p.nfl_team}, age {p.age or '?'})"
+                f" [{label}] — KTC: {ktc_val}"
+            )
+    rows.sort(key=lambda x: -int(x.split("KTC: ")[1]))
+    return "\n".join(rows[:150])
+
+
+def _filter_injury_report(injury_text: str, league: LeagueInfo) -> str:
+    """Trim the full injury report to only players on league rosters."""
+    roster_names = {
+        p.name.lower()
+        for team in league.teams
+        for p in team.roster
+    }
+    lines = []
+    for line in injury_text.splitlines():
+        name_part = line.split("(")[0].strip().lower()
+        if any(name_part in rn or rn in name_part for rn in roster_names if rn):
+            lines.append(line)
+    return "\n".join(lines) if lines else "No injury flags for current league players."
+
+
+def _fetch_recent_trades(league: LeagueInfo) -> str:
+    """Fetch and format recent completed trades, resolving roster IDs to team names."""
+    from ..tools.sleeper_tool import _load_player_db
+    roster_map = {t.team_id: t.name for t in league.teams}
+    player_db = _load_player_db()
+    all_trades: list[tuple[int, dict]] = []
+    for w in range(1, 6):
+        for t in get_transactions(w):
+            if t.get("type") == "trade" and t.get("status") == "complete":
+                all_trades.append((w, t))
+    if not all_trades:
+        return "No completed trades found in recent weeks."
+    lines = [f"Recent trades ({len(all_trades)} found):"]
+    for week, trade in all_trades[-20:]:
+        adds: dict = trade.get("adds") or {}
+        by_roster: dict[str, list[str]] = {}
+        for pid, rid in adds.items():
+            pname = player_db.get(str(pid), {}).get("full_name", f"Player:{pid}")
+            by_roster.setdefault(str(rid), []).append(pname)
+        picks = trade.get("draft_picks") or []
+        lines.append(f"\nWeek {week} trade:")
+        for rid, players in by_roster.items():
+            tname = roster_map.get(str(rid), f"Roster {rid}")
+            lines.append(f"  {tname} received: {', '.join(players)}")
+        if picks:
+            lines.append(f"  + {len(picks)} draft pick(s) exchanged")
+    return "\n".join(lines)
+
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """You are an expert dynasty fantasy football analyst and personal advisor. Your user (spuddister) is brand new to fantasy football. They have taken over a dynasty team that finished 2nd place last season and is already built to compete.
@@ -213,7 +263,7 @@ DYNASTY PRINCIPLES:
 - Draft picks are tradeable assets — future first-round picks have real value.
 
 YOUR APPROACH:
-- Always use your tools before answering — search Reddit, check KTC, get injury/news first.
+- Always use your tools before answering — check KTC values, get injury reports, pull player news first.
 - Explain every recommendation in plain language the user can understand.
 - Be decisive: give clear STARTER/BENCH/TRADE/DROP calls, not vague hedging.
 - For trades: evaluate both dynasty (long-term) AND redraft (this season) value separately.
@@ -247,19 +297,35 @@ class FantasyAgent:
         ]
 
         while True:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=config,
-            )
+            while True:
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model,
+                        contents=contents,
+                        config=config,
+                    )
+                    break
+                except (ClientError, ServerError, httpx.TimeoutException) as e:
+                    code = getattr(e, "code", 0)
+                    if isinstance(e, (ClientError, ServerError)) and code not in (429, 503):
+                        raise
+                    m = re.search(r"retryDelay.*?(\d+)s", str(e))
+                    delay = int(m.group(1)) + 2 if m else 32
+                    time.sleep(delay)
+
 
             candidate = response.candidates[0]
             model_content = candidate.content
 
+            # Guard against empty/blocked responses (e.g. post-rate-limit artefacts)
+            if model_content is None or not model_content.parts:
+                finish = getattr(candidate, "finish_reason", "UNKNOWN")
+                return f"The model returned an empty response (finish_reason={finish}). Try again."
+
             # Collect text and function calls
             text_parts: list[str] = []
             function_calls: list[Any] = []
-            for part in (model_content.parts or []):
+            for part in model_content.parts:
                 if part.text:
                     text_parts.append(part.text)
                 if part.function_call:
@@ -267,7 +333,7 @@ class FantasyAgent:
 
             # No tool calls — done
             if not function_calls:
-                return "\n".join(text_parts) or "No response generated."
+                return "\n".join(text_parts) or "The model produced no output. Try again."
 
             # Add model turn to history
             contents.append(model_content)
@@ -301,7 +367,7 @@ class FantasyAgent:
 
 {roster_text}
 
-For each player: search Reddit, check KTC dynasty value, get news/injury updates.
+For each player: check KTC dynasty value, get injury status and recent news.
 
 Then provide:
 - Dynasty tier for each player: Elite / Great / Good / Fringe / Depth / Drop
@@ -328,8 +394,7 @@ I'm new to fantasy football — explain your reasoning clearly."""
 Steps:
 1. Get the full injury report
 2. Check Sleeper trending adds
-3. Search Reddit weekly discussion thread
-4. Check news for any questionable players on my roster
+3. Check news for any questionable players on my roster
 
 Deliver:
 - Optimal starting lineup (QB, RB, RB, WR, WR, TE, FLEX, FLEX, FLEX, SUPER_FLEX)
@@ -366,8 +431,7 @@ Context: {context}
 
 Steps:
 1. Check KTC dynasty value for every player in the trade
-2. Search Reddit for sentiment on each player
-3. Get recent news for each player
+2. Get recent news for each player
 
 Analysis:
 - Dynasty value comparison (KTC scores)
@@ -397,9 +461,8 @@ CURRENT BOARD ({num_available} available, {num_drafted} already drafted):
 {roster_ctx}
 
 Steps:
-1. Search Reddit r/dynastyff for "2026 rookie rankings" and top prospects
-2. Check KTC dynasty values for the top 10 available rookies
-3. Get news on the top 5 prospects (landing spot, depth chart, injury history)
+1. Check KTC dynasty values for the top 10 available rookies
+2. Get news on the top 5 prospects (landing spot, depth chart, injury history)
 
 Deliver:
 
@@ -435,8 +498,7 @@ Overhyped rookies who don't fit dynasty or this scoring format."""
 Step 1 — Gather data:
 1. Get the full injury report
 2. Check Sleeper trending adds and drops
-3. Get the weekly Reddit discussion digest
-4. Check news for each player with an injury status on my roster
+3. Check news for each player with an injury status on my roster
 
 Step 2 — Deliver this structured report:
 
@@ -471,10 +533,8 @@ Numbered to-do list of everything to do in Sleeper before the week locks."""
         prompt = """I'm preparing for a 4-round dynasty rookie draft (Full PPR + SUPER_FLEX, 10 teams).
 
 Steps:
-1. Search Reddit r/dynastyff for "2026 rookie rankings" and "best dynasty rookies 2026"
-2. Search for the top 5 most-discussed individual rookies
-3. Check KTC dynasty values for top rookies
-4. Get news on top prospects (landing spot, depth chart, injury history)
+1. Check KTC dynasty values for top rookies
+2. Get news on top prospects (landing spot, depth chart, injury history)
 
 Deliver:
 - Top 20 dynasty rookie rankings with tier breaks
@@ -491,3 +551,93 @@ Deliver:
         if league and league.my_team:
             context = f"\n\nFor context, here's my current roster:\n{format_roster_summary(league)}"
         return self._run_agent_loop(question + context, on_tool_call)
+
+    def generate_trade_proposal(
+        self,
+        league: LeagueInfo,
+        target_team: str | None = None,
+        on_tool_call: Any = None,
+    ) -> str:
+        if not league.my_team:
+            return "Could not find your team. Check SLEEPER_USER_ID in .env."
+
+        # Pre-fetch all data in Python (fast, cached) — avoids multiple API round trips
+        if on_tool_call:
+            on_tool_call("get_ktc_values", {})
+        ktc_all = get_ktc_values()
+
+        if on_tool_call:
+            on_tool_call("get_injury_report", {})
+        injury_text = _filter_injury_report(get_injury_report(), league)
+
+        if on_tool_call:
+            on_tool_call("get_recent_trades", {})
+        trades_text = _fetch_recent_trades(league)
+
+        ktc_table = _build_ktc_roster_table(league, ktc_all)
+        my_roster = format_roster_summary(league)
+        all_rosters = format_all_teams_summary(league)
+
+        target_line = (
+            f"\nFocus all proposals on trading with: {target_team}"
+            if target_team
+            else "\nIdentify the 3 best trading partners and generate one proposal per partner."
+        )
+
+        prompt = f"""Generate trade proposals I should send to other teams in my dynasty league.
+
+MY ROSTER:
+{my_roster}
+
+ALL OPPONENT ROSTERS:
+{all_rosters}
+
+KTC DYNASTY VALUES (all players on league rosters):
+{ktc_table}
+
+RECENT LEAGUE TRADES:
+{trades_text}
+
+CURRENT INJURY REPORT:
+{injury_text}
+{target_line}
+
+FOR EACH PROPOSAL, structure it exactly like this:
+
+### Proposal [N]: [My team] → [Target team]
+**Why this partner:** [1-2 sentences: their need + their surplus that fits me]
+**I send:** [list of players/picks I give up]
+**I receive:** [list of players/picks I get back]
+**KTC value check:** I give ~X | I receive ~Y | Delta: +Z in my favor
+**Why they'd accept:** [explain the genuine benefit to them — position need filled, age upgrade, etc.]
+**Sell-high angle:** [if applicable — why now is the right time to move a player I'm giving]
+
+RULES:
+- Proposals must use real players from the rosters shown above — do not invent players
+- Each deal should be slightly favorable to me by KTC (aim for 5-15% advantage, not lopsided)
+- The other team must have a genuine reason to say yes — fill a real need, not just take a bad deal
+- In a SUPER_FLEX league, QBs have outsized value — factor that in
+- Dynasty age curves matter: a 22-year-old is worth more than the same KTC as a 30-year-old
+- End with a short ACTION LIST: which proposal to send first and any timing notes"""
+
+        # Single Gemini call — all data is already in the prompt
+        config = types.GenerateContentConfig(system_instruction=_SYSTEM_PROMPT)
+        contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+        while True:
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model, contents=contents, config=config,
+                )
+                break
+            except (ClientError, ServerError, httpx.TimeoutException) as e:
+                code = getattr(e, "code", 0)
+                if isinstance(e, (ClientError, ServerError)) and code not in (429, 503):
+                    raise
+                m = re.search(r"retryDelay.*?(\d+)s", str(e))
+                delay = int(m.group(1)) + 2 if m else 32
+                time.sleep(delay)
+
+        candidate = response.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            return "The model returned an empty response. Try again."
+        return "\n".join(p.text for p in candidate.content.parts if p.text)
